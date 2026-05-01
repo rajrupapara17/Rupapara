@@ -1,0 +1,350 @@
+# region imports
+from AlgorithmImports import *
+from datetime import date, datetime, timedelta
+import numpy as np
+# endregion
+
+class FiveEMA0DTE_SPY_Long(QCAlgorithm):
+    """
+    5 EMA Mean Reversion Strategy — SPY 0DTE ATM CALL Options
+    Bullish bias: buys calls when price dips below 5 EMA then recovers.
+    Trend filter: only enter when spot > 20 EMA (uptrend confirmed).
+    Rolling 5-year backtest ending at current date.
+    """
+
+    RISK_REWARD  = 2
+    EMA_LENGTH   = 5
+    EMA_TREND    = 20
+    QTY_PCT      = 0.05
+    HOLD_MINUTES = 30
+
+    def initialize(self):
+        _5yr_ago = datetime.now() - timedelta(days=5*365)
+        self.set_start_date(_5yr_ago.year, _5yr_ago.month, _5yr_ago.day)
+
+        self.set_cash(100_000)
+        self.set_time_zone(TimeZones.NEW_YORK)
+
+        spy = self.add_equity("SPY", Resolution.MINUTE)
+        spy.set_data_normalization_mode(DataNormalizationMode.RAW)
+        self._spx = spy.symbol
+
+        opt = self.add_option("SPY", Resolution.MINUTE)
+        opt.set_filter(lambda u: u.expiration(0, 0).strikes(-10, 10).calls_only())
+        self._opt = opt.symbol
+
+        # ── 5 EMA ─────────────────────────────────────────────────────────────
+        self._ema_k      = 2.0 / (self.EMA_LENGTH + 1)
+        self._ema_value  = None
+        self._ema_prev   = None
+        self._ema_seeded = False
+
+        # ── 20 EMA trend filter ───────────────────────────────────────────────
+        self._ema20_k     = 2.0 / (self.EMA_TREND + 1)
+        self._ema20_value = None
+
+        # ── Daily OHLC accumulators ───────────────────────────────────────────
+        self._prev_low   = None
+        self._prev_high  = None
+        self._curr_low   = None
+        self._curr_high  = None
+        self._last_date  = None
+
+        # ── Pine state variables ──────────────────────────────────────────────
+        self._long_c     = 0
+        self._ssl_hit_c  = 0
+        self._star_hit_c = 0
+        self._ssl        = None
+        self._star       = None
+        self._buy_at     = None
+
+        # ── Trade / session state ─────────────────────────────────────────────
+        self._trade        : dict | None = None
+        self._signal_today : bool        = False
+
+        self.set_warm_up(self.EMA_TREND + 15, Resolution.DAILY)
+
+    # =========================================================================
+    # EMA helpers
+    # =========================================================================
+
+    def _seed_ema(self) -> bool:
+        hist   = self.history[TradeBar](self._spx, self.EMA_TREND + 15, Resolution.DAILY)
+        closes = [float(b.close) for b in hist]
+        if len(closes) < self.EMA_TREND:
+            self.log(f"EMA seed: only {len(closes)} bars")
+            return False
+
+        # Seed 5 EMA
+        ema5 = float(np.mean(closes[:self.EMA_LENGTH]))
+        for c in closes[self.EMA_LENGTH:]:
+            ema5 = c * self._ema_k + ema5 * (1 - self._ema_k)
+        self._ema_value = ema5
+        self._ema_prev  = ema5
+
+        # Seed 20 EMA
+        ema20 = float(np.mean(closes[:self.EMA_TREND]))
+        for c in closes[self.EMA_TREND:]:
+            ema20 = c * self._ema20_k + ema20 * (1 - self._ema20_k)
+        self._ema20_value = ema20
+
+        self.log(f"EMA5={ema5:.2f}  EMA20={ema20:.2f}")
+        return True
+
+    def _advance_ema(self, close: float):
+        self._ema_prev    = self._ema_value
+        self._ema_value   = close * self._ema_k   + self._ema_value   * (1 - self._ema_k)
+        self._ema20_value = close * self._ema20_k + self._ema20_value * (1 - self._ema20_k)
+
+    # =========================================================================
+    # Day-roll
+    # =========================================================================
+
+    def _roll_day(self, completed_close: float):
+        self._prev_low  = self._curr_low
+        self._prev_high = self._curr_high
+        self._advance_ema(completed_close)
+        self._long_c     = 0
+        self._ssl_hit_c  = 0
+        self._star_hit_c = 0
+        self._ssl        = None
+        self._star       = None
+        self._buy_at     = None
+        self._signal_today = False
+
+    # =========================================================================
+    # Main per-minute handler
+    # =========================================================================
+
+    def on_data(self, data: Slice):
+        if self.is_warming_up:
+            return
+
+        if not self._ema_seeded:
+            self._ema_seeded = self._seed_ema()
+            if not self._ema_seeded:
+                return
+
+        if not data.quote_bars.contains_key(self._spx):
+            return
+
+        bar   = data.quote_bars[self._spx]
+        now   = self.time
+        today = now.date()
+
+        # ── Day-roll ──────────────────────────────────────────────────────────
+        if self._last_date is not None and today != self._last_date:
+            if self._curr_low is not None:
+                self._roll_day((self._curr_high + self._curr_low) / 2.0)
+            self._curr_low  = float(bar.low)
+            self._curr_high = float(bar.high)
+        else:
+            if self._curr_low is None:
+                self._curr_low  = float(bar.low)
+                self._curr_high = float(bar.high)
+            else:
+                self._curr_low  = min(self._curr_low,  float(bar.low))
+                self._curr_high = max(self._curr_high, float(bar.high))
+
+        self._last_date = today
+
+        if self._prev_low is None or self._ema_prev is None:
+            return
+
+        bar_high  = float(bar.high)
+        bar_low   = float(bar.low)
+        bar_close = float(bar.close)
+
+        # ── Manage open trade ─────────────────────────────────────────────────
+        if self._trade is not None:
+            elapsed = (now - self._trade["entry_time"]).total_seconds() / 60.0
+            if elapsed >= self.HOLD_MINUTES:
+                self.log(f"TIME EXIT — {elapsed:.1f} min after entry")
+                self._close("TIME")
+            else:
+                self._check_sl_tp(bar_high, bar_low)
+            return
+
+        self._evaluate_pine(bar_high, bar_low)
+
+        # ── Entry window: 09:30 – 12:00 ET ───────────────────────────────────
+        in_window = (
+            (now.hour == 9  and now.minute >= 30) or
+            (now.hour == 10) or
+            (now.hour == 11) or
+            (now.hour == 12 and now.minute == 0)
+        )
+
+        # ── Trend filter: only buy calls in uptrend ───────────────────────────
+        in_uptrend = (
+            self._ema20_value is not None and
+            bar_close > self._ema20_value
+        )
+
+        if in_window and not self._signal_today and self._long_c >= 1 and in_uptrend:
+            self._enter(data, bar_close)
+
+    # =========================================================================
+    # Pine signal state machine — BULLISH version
+    # =========================================================================
+
+    def _evaluate_pine(self, bar_high: float, bar_low: float):
+        low1  = self._prev_low
+        high1 = self._prev_high
+        ema1  = self._ema_prev
+
+        # Bullish: yesterday's high was below EMA, today is pushing higher
+        long_signal = (
+            high1 < ema1 and
+            high1 < self._curr_high and
+            self._long_c == 0
+        )
+
+        ssl_hit = (
+            self._ssl is not None and
+            bar_low < self._ssl and
+            self._long_c > 0 and
+            self._ssl_hit_c == 0
+        )
+
+        star_hit = (
+            self._star is not None and
+            bar_high > self._star and
+            self._long_c > 0 and
+            self._star_hit_c == 0
+        )
+
+        if long_signal:
+            self._long_c     += 1
+            self._ssl_hit_c   = 0
+            self._star_hit_c  = 0
+            self._ssl         = low1
+            starl             = (high1 - low1) * self.RISK_REWARD
+            self._star        = high1 + starl
+            self._buy_at      = high1
+            self.log(
+                f"PINE SIGNAL | buy_at={self._buy_at:.2f}  "
+                f"ssl={self._ssl:.2f}  star={self._star:.2f}  "
+                f"ema1={ema1:.2f}  high1={high1:.2f}"
+            )
+        elif not ssl_hit and not star_hit and self._long_c > 0:
+            self._ssl_hit_c  = 0
+            self._star_hit_c = 0
+
+        if ssl_hit:
+            self._long_c    = 0
+            self._ssl_hit_c += 1
+            self.log(f"SSL HIT (flat) low={bar_low:.2f} ssl={self._ssl:.2f}")
+        elif star_hit:
+            self._long_c     = 0
+            self._star_hit_c += 1
+            self.log(f"STAR HIT (flat) high={bar_high:.2f} star={self._star:.2f}")
+
+    # =========================================================================
+    # Stop / target check
+    # =========================================================================
+
+    def _check_sl_tp(self, bar_high: float, bar_low: float):
+        if self._trade is None or self._ssl is None or self._star is None:
+            return
+        if bar_low < self._ssl:
+            self.log(f"STOP HIT  low={bar_low:.2f} <= ssl={self._ssl:.2f}")
+            self._close("STOP")
+        elif bar_high > self._star:
+            self.log(f"TARGET HIT  high={bar_high:.2f} >= star={self._star:.2f}")
+            self._close("TARGET")
+
+    # =========================================================================
+    # Trade entry
+    # =========================================================================
+
+    def _enter(self, data: Slice, spot: float):
+        contract_sym = self._atm_call(data, spot)
+        if contract_sym is None:
+            self.log("No 0DTE ATM call available — skipping entry")
+            return
+
+        mid = self._mid_price(contract_sym, data)
+        if mid <= 0:
+            self.log("Cannot price option — skipping entry")
+            return
+
+        qty = max(1, int(
+            self.portfolio.total_portfolio_value * self.QTY_PCT / (mid * 100)
+        ))
+
+        self.market_order(contract_sym, qty)
+
+        self._trade = {
+            "contract"   : contract_sym,
+            "qty"        : qty,
+            "entry_time" : self.time,
+        }
+        self._signal_today = True
+        self.log(
+            f"ENTERED  {qty}x CALL {contract_sym.value}  "
+            f"mid={mid:.2f}  spot={spot:.2f}  "
+            f"ssl={self._ssl:.2f}  star={self._star:.2f}"
+        )
+
+    # =========================================================================
+    # Trade close
+    # =========================================================================
+
+    def _close(self, reason: str):
+        if self._trade is None:
+            return
+        sym = self._trade["contract"]
+        qty = self._trade["qty"]
+        self._trade      = None
+        self._long_c     = 0
+        self._ssl_hit_c  = 0
+        self._star_hit_c = 0
+        if sym not in self.securities:
+            self.log(f"[{reason}] Contract {sym.value} not in securities — skipped")
+            return
+        self.market_order(sym, -qty)
+        self.log(f"CLOSED [{reason}]  {sym.value}  qty={qty}")
+
+    # =========================================================================
+    # Option chain helpers
+    # =========================================================================
+
+    def _atm_call(self, data: Slice, spot: float) -> "Symbol | None":
+        chain = data.option_chains.get(self._opt)
+        if chain is None:
+            self.log("Option chain is None")
+            return None
+        today = self.time.date()
+        calls = [
+            c for c in chain
+            if c.right == OptionRight.CALL and c.expiry.date() == today
+        ]
+        if not calls:
+            self.log(f"No 0DTE calls (chain size={sum(1 for _ in chain)})")
+            return None
+        return min(calls, key=lambda c: abs(c.strike - spot)).symbol
+
+    def _mid_price(self, sym: "Symbol", data: Slice) -> float:
+        chain = data.option_chains.get(self._opt)
+        if chain is None:
+            return 0.0
+        for c in chain:
+            if c.symbol == sym:
+                b, a = float(c.bid_price), float(c.ask_price)
+                return (b + a) / 2.0 if b > 0 and a > 0 else float(c.last_price)
+        return 0.0
+
+    # =========================================================================
+    # Order fill logging
+    # =========================================================================
+
+    def on_order_event(self, order_event: OrderEvent):
+        if order_event.status != OrderStatus.FILLED:
+            return
+        direction = "BUY" if order_event.fill_quantity > 0 else "SELL"
+        self.log(
+            f"FILLED [{direction}]  {order_event.symbol.value}  "
+            f"qty={order_event.fill_quantity}  "
+            f"price={order_event.fill_price:.4f}"
+        )
