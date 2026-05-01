@@ -1,0 +1,704 @@
+# region imports
+from AlgorithmImports import *
+from datetime import datetime, timedelta
+import numpy as np
+# endregion
+
+class SPXW_Hammer_Strategy(QCAlgorithm):
+    """
+    SPXW 0DTE Hammer Candle Strategy
+    ─────────────────────────────────
+    Entry ONLY after 11:00 AM ET
+    Premium filter: $0.10 – $4.00 (strike must cost less than $4)
+
+    ENTRY CONDITIONS (ALL must pass):
+      Step 1 — Hammer candle forms BELOW 5 EMA on 5-min chart
+      Step 2 — Confirmation: Big Green candle OR full breakout above 5+15 EMA
+      Step 3 — Next 1-min bar breaks ABOVE confirmation high → BUY CALL
+
+    Strike : SPX spot + 15 pts OTM
+    SL     : -50% premium
+    TP     : +$100 OR 1:3 RR (whichever first)
+    Time   : 2 hours max | EOD 3:45 PM
+    """
+
+    EMA_FAST  = 5
+    EMA_TREND = 15
+
+    HOLD_MINUTES  = 120
+    STRIKE_OFFSET = 15.0
+    STRIKE_TOL    = 15.0
+    LOTS          = 1
+
+    # ── Entry window ──────────────────────────────────────────────────────────
+    ENTRY_START_HOUR = 11     # no trades before 11:00 AM
+    ENTRY_START_MIN  = 0
+    ENTRY_END_HOUR   = 15
+    ENTRY_END_MIN    = 30
+
+    # ── Premium: MUST be under $4.00 ─────────────────────────────────────────
+    PREMIUM_MIN   = 0.10
+    PREMIUM_MAX   = 4.00      # ← hard cap at $4.00
+
+    TP_DOLLARS    = 100.00
+    RR_RATIO      = 3.0
+    SL_PCT        = 0.50
+
+    # ── Hammer parameters ─────────────────────────────────────────────────────
+    HAMMER_WICK_RATIO    = 2.0
+    HAMMER_UPPER_MAX     = 0.3
+    HAMMER_MIN_RANGE     = 2.0
+    MIN_GREEN_BODY_RATIO = 0.5
+
+    def initialize(self):
+        self.set_start_date(2024, 1, 1)
+        self.set_cash(500_000)
+        self.set_time_zone(TimeZones.NEW_YORK)
+
+        # ── SPY — price feed + EMA ────────────────────────────────────────────
+        spy = self.add_equity("SPY", Resolution.MINUTE)
+        spy.set_data_normalization_mode(DataNormalizationMode.RAW)
+        self._spy = spy.symbol
+
+        # ── SPXW 0DTE ─────────────────────────────────────────────────────────
+        spxw = self.add_index_option("SPX", "SPXW", Resolution.MINUTE)
+        spxw.set_filter(lambda u: u.expiration(0, 0).strikes(-30, 30))
+        self._opt = spxw.symbol
+
+        # ── SPX index for strike reference ────────────────────────────────────
+        try:
+            spx             = self.add_index("SPX", Resolution.MINUTE)
+            self._spx       = spx.symbol
+            self._spx_added = True
+        except:
+            self._spx       = None
+            self._spx_added = False
+
+        # ── EMA ───────────────────────────────────────────────────────────────
+        self._k5         = 2.0 / (self.EMA_FAST  + 1)
+        self._k15        = 2.0 / (self.EMA_TREND + 1)
+        self._ema5       = None
+        self._ema15      = None
+        self._ema_seeded = False
+
+        # ── State machine ─────────────────────────────────────────────────────
+        # Phase 0: scanning for hammer below 5 EMA
+        # Phase 1: hammer found — waiting for confirmation candle
+        # Phase 2: confirmed — watching 1-min breakout above conf high
+        self._phase          = 0
+        self._hammer_candle  = None
+        self._confirm_candle = None
+        self._watch_high     = None
+        self._trade          = None
+        self._trades_today   = 0
+        self._spx_spot       = None
+
+        self._bar5      = self._new_bar5()
+        self._last_data = None
+
+        self.set_warm_up(60, Resolution.DAILY)
+
+    # =========================================================================
+    # Constructors
+    # =========================================================================
+
+    def _new_bar5(self):
+        return {
+            "open"      : None,
+            "high"      : None,
+            "low"       : None,
+            "close"     : None,
+            "bar_count" : 0,
+            "bar_start" : None,
+            "completed" : None,
+        }
+
+    # =========================================================================
+    # EMA
+    # =========================================================================
+
+    def _seed_ema(self) -> bool:
+        hist   = self.history[TradeBar](self._spy, 60, Resolution.DAILY)
+        closes = [float(b.close) for b in hist]
+        if len(closes) < self.EMA_TREND:
+            return False
+
+        ema5 = float(np.mean(closes[:self.EMA_FAST]))
+        for c in closes[self.EMA_FAST:]:
+            ema5 = c * self._k5 + ema5 * (1 - self._k5)
+        self._ema5 = ema5
+
+        ema15 = float(np.mean(closes[:self.EMA_TREND]))
+        for c in closes[self.EMA_TREND:]:
+            ema15 = c * self._k15 + ema15 * (1 - self._k15)
+        self._ema15 = ema15
+
+        self.log(f"EMA seeded  5EMA={ema5:.3f}  15EMA={ema15:.3f}")
+        return True
+
+    def _update_ema(self, close: float):
+        self._ema5  = close * self._k5  + self._ema5  * (1 - self._k5)  if self._ema5  else close
+        self._ema15 = close * self._k15 + self._ema15 * (1 - self._k15) if self._ema15 else close
+
+    # =========================================================================
+    # SPX spot — SPY × 10 fallback
+    # =========================================================================
+
+    def _get_spx_spot(self, data, spy_close: float) -> float:
+        if self._spx_added and self._spx:
+            if data.bars.contains_key(self._spx):
+                p = float(data.bars[self._spx].close)
+                if p > 0:
+                    self._spx_spot = p
+                    return p
+            if data.quote_bars.contains_key(self._spx):
+                qb = data.quote_bars[self._spx]
+                p  = (float(qb.bid.close) + float(qb.ask.close)) / 2.0
+                if p > 0:
+                    self._spx_spot = p
+                    return p
+        approx         = spy_close * 10.0
+        self._spx_spot = approx
+        return approx
+
+    # =========================================================================
+    # Entry window check
+    # =========================================================================
+
+    def _in_entry_window(self, now) -> bool:
+        """
+        Only allow NEW entries after 11:00 AM and before 3:30 PM.
+        Existing trades are managed regardless of window.
+        """
+        total_now   = now.hour * 60 + now.minute
+        window_start = self.ENTRY_START_HOUR * 60 + self.ENTRY_START_MIN  # 660 = 11:00
+        window_end   = self.ENTRY_END_HOUR   * 60 + self.ENTRY_END_MIN    # 930 = 15:30
+        return window_start <= total_now <= window_end
+
+    # =========================================================================
+    # Day-roll
+    # =========================================================================
+
+    def _roll_day(self):
+        self._phase          = 0
+        self._hammer_candle  = None
+        self._confirm_candle = None
+        self._watch_high     = None
+        self._trades_today   = 0
+        self._bar5           = self._new_bar5()
+        self.log("DAY ROLLED — reset to Phase 0")
+
+    # =========================================================================
+    # Hammer candle detector
+    # =========================================================================
+
+    def _is_hammer(self, c, ema5: float) -> tuple:
+        """
+        Hammer BELOW 5 EMA:
+          1. close < 5 EMA
+          2. range >= HAMMER_MIN_RANGE
+          3. lower wick >= 2× body
+          4. upper wick <= 30% of range
+          5. body not a doji (>= 0.10)
+        """
+        o  = c["open"]
+        cl = c["close"]
+        h  = c["high"]
+        l  = c["low"]
+
+        if cl >= ema5:
+            return False, f"close={cl:.3f} >= ema5={ema5:.3f}"
+
+        total_range = h - l
+        if total_range < self.HAMMER_MIN_RANGE:
+            return False, f"range={total_range:.3f} < {self.HAMMER_MIN_RANGE}"
+
+        body       = abs(cl - o)
+        body_top   = max(o, cl)
+        body_bot   = min(o, cl)
+        lower_wick = body_bot - l
+        upper_wick = h - body_top
+
+        if body < 0.10:
+            return False, f"body={body:.3f} doji"
+
+        if lower_wick < self.HAMMER_WICK_RATIO * body:
+            return False, (
+                f"lower_wick={lower_wick:.3f} < "
+                f"{self.HAMMER_WICK_RATIO}×body={body:.3f}"
+            )
+
+        if upper_wick > self.HAMMER_UPPER_MAX * total_range:
+            return False, (
+                f"upper_wick={upper_wick:.3f} > "
+                f"{self.HAMMER_UPPER_MAX}×range={total_range:.3f}"
+            )
+
+        return True, (
+            f"o={o:.3f} c={cl:.3f} h={h:.3f} l={l:.3f}  "
+            f"body={body:.3f}  lower_wick={lower_wick:.3f}  "
+            f"upper_wick={upper_wick:.3f}  ema5={ema5:.3f}"
+        )
+
+    # =========================================================================
+    # Confirmation candle detector
+    # =========================================================================
+
+    def _is_confirmation(self, c, ema5: float, ema15: float,
+                          hammer: dict) -> tuple:
+        """
+        EITHER:
+          A) Big Green Candle — close>open, body>=50% range, close>hammer high
+          B) Full EMA breakout — open/close/low all above BOTH 5 and 15 EMA
+        """
+        o  = c["open"]
+        cl = c["close"]
+        h  = c["high"]
+        l  = c["low"]
+
+        rng  = h - l
+        body = abs(cl - o)
+
+        # ── Condition A: Big Green ────────────────────────────────────────────
+        if (cl > o and
+                rng > 0 and
+                (body / rng) >= self.MIN_GREEN_BODY_RATIO and
+                cl > hammer["high"]):
+            return True, (
+                f"BIG GREEN ✓  o={o:.3f} c={cl:.3f}  "
+                f"body_ratio={body/rng:.2f}  "
+                f"above_hammer_high={hammer['high']:.3f}"
+            )
+
+        # ── Condition B: EMA Breakout ─────────────────────────────────────────
+        if (o  > ema5 and o  > ema15 and
+                cl > ema5 and cl > ema15 and
+                l  > ema5 and l  > ema15):
+            return True, (
+                f"EMA BREAKOUT ✓  o={o:.3f} c={cl:.3f} l={l:.3f}  "
+                f"5EMA={ema5:.3f}  15EMA={ema15:.3f}"
+            )
+
+        return False, (
+            f"green={(cl>o)}  body_ratio={body/rng if rng>0 else 0:.2f}  "
+            f"above_hmr={(cl>hammer['high'])}  "
+            f"ema_break={(o>ema5 and cl>ema5 and l>ema5 and o>ema15 and cl>ema15 and l>ema15)}"
+        )
+
+    # =========================================================================
+    # 5-min bar accumulator
+    # =========================================================================
+
+    def _accumulate_bar5(self, o, h, l, c, now) -> bool:
+        b5         = self._bar5
+        slot_min   = (now.minute // 5) * 5
+        slot_start = now.replace(minute=slot_min, second=0, microsecond=0)
+
+        if b5["bar_start"] is None or b5["bar_start"] != slot_start:
+            completed = b5["bar_count"] > 0
+            if completed:
+                b5["completed"] = {
+                    "open"  : b5["open"],  "high" : b5["high"],
+                    "low"   : b5["low"],   "close": b5["close"],
+                    "time"  : b5["bar_start"],
+                }
+            b5["bar_start"] = slot_start
+            b5["open"]      = o
+            b5["high"]      = h
+            b5["low"]       = l
+            b5["close"]     = c
+            b5["bar_count"] = 1
+            return completed
+        else:
+            b5["high"]  = max(b5["high"], h)
+            b5["low"]   = min(b5["low"],  l)
+            b5["close"] = c
+            b5["bar_count"] += 1
+            return False
+
+    # =========================================================================
+    # Main per-minute handler
+    # =========================================================================
+
+    def on_data(self, data: Slice):
+        self._last_data = data
+
+        if self.is_warming_up:
+            return
+
+        if not self._ema_seeded:
+            self._ema_seeded = self._seed_ema()
+            if not self._ema_seeded:
+                return
+
+        # ── SPY bar ───────────────────────────────────────────────────────────
+        spy_close = spy_open = spy_high = spy_low = None
+
+        if data.bars.contains_key(self._spy):
+            b         = data.bars[self._spy]
+            spy_close = float(b.close)
+            spy_open  = float(b.open)
+            spy_high  = float(b.high)
+            spy_low   = float(b.low)
+        elif data.quote_bars.contains_key(self._spy):
+            qb        = data.quote_bars[self._spy]
+            spy_close = (float(qb.bid.close) + float(qb.ask.close)) / 2.0
+            spy_open  = (float(qb.bid.open)  + float(qb.ask.open))  / 2.0
+            spy_high  = (float(qb.bid.high)  + float(qb.ask.high))  / 2.0
+            spy_low   = (float(qb.bid.low)   + float(qb.ask.low))   / 2.0
+        else:
+            return
+
+        now      = self.time
+        today    = now.date()
+        spx_spot = self._get_spx_spot(data, spy_close)
+
+        # ── Day-roll ──────────────────────────────────────────────────────────
+        if self._bar5["bar_start"] is not None and \
+           self._bar5["bar_start"].date() != today:
+            self._roll_day()
+
+        # ── EOD close at 3:45 PM ─────────────────────────────────────────────
+        if now.hour == 15 and now.minute >= 45:
+            if self._trade:
+                self._close("EOD", data)
+            return
+
+        # ── Manage open trade (no time restriction — manage always) ───────────
+        if self._trade:
+            elapsed = (now - self._trade["entry_time"]).total_seconds() / 60.0
+            if elapsed >= self.HOLD_MINUTES:
+                self._close("TIME", data)
+            else:
+                self._check_sl_tp(data)
+            self._update_ema(spy_close)
+            self._accumulate_bar5(spy_open, spy_high, spy_low, spy_close, now)
+            return
+
+        # ── EMA + bar update ──────────────────────────────────────────────────
+        self._update_ema(spy_close)
+        completed = self._accumulate_bar5(
+            spy_open, spy_high, spy_low, spy_close, now
+        )
+
+        if self._ema5 is None or self._ema15 is None:
+            return
+
+        ema5  = self._ema5
+        ema15 = self._ema15
+
+        # ── Entry window gate — NO new signals before 11:00 AM ────────────────
+        in_window = self._in_entry_window(now)
+
+        if not in_window:
+            # Still accumulate bars and EMA but don't look for signals
+            return
+
+        # ── STATE MACHINE (only runs after 11:00 AM) ──────────────────────────
+
+        # PHASE 0 — Look for hammer below 5 EMA
+        if self._phase == 0 and completed:
+            c5           = self._bar5["completed"]
+            ok, reason   = self._is_hammer(c5, ema5)
+            if ok:
+                self._hammer_candle = c5
+                self._phase         = 1
+                self.log(f"[11AM+] PHASE 1 — HAMMER ✓  {reason}  {c5['time']}")
+            else:
+                self.log(f"[11AM+] Phase0 not hammer: {reason}")
+
+        # PHASE 1 — Wait for confirmation candle
+        elif self._phase == 1 and completed:
+            c5           = self._bar5["completed"]
+            ok, reason   = self._is_confirmation(c5, ema5, ema15, self._hammer_candle)
+            if ok:
+                self._confirm_candle = c5
+                self._watch_high     = c5["high"]
+                self._phase          = 2
+                self.log(
+                    f"[11AM+] PHASE 2 — CONFIRMED  {reason}  "
+                    f"watch_high={self._watch_high:.3f}  {c5['time']}"
+                )
+            else:
+                self.log(f"[11AM+] Phase1 FAILED — reset  {reason}")
+                self._phase         = 0
+                self._hammer_candle = None
+
+        # PHASE 2 — Watch 1-min bar for breakout above confirmation high
+        elif self._phase == 2:
+
+            # Invalidate if price falls below hammer low
+            if spy_close < self._hammer_candle["low"]:
+                self.log(
+                    f"[11AM+] Phase2 INVALIDATED — "
+                    f"close={spy_close:.3f} < hammer_low={self._hammer_candle['low']:.3f}"
+                )
+                self._phase          = 0
+                self._hammer_candle  = None
+                self._confirm_candle = None
+                self._watch_high     = None
+                return
+
+            # Breakout trigger
+            if spy_high > self._watch_high:
+                self.log(
+                    f"[11AM+] PHASE 2 BREAKOUT ↑  "
+                    f"spy_high={spy_high:.3f} > watch={self._watch_high:.3f}  "
+                    f"SPX={spx_spot:.2f}  {now.strftime('%H:%M')}"
+                )
+                target_strike        = spx_spot + self.STRIKE_OFFSET
+                self._phase          = 0
+                self._hammer_candle  = None
+                self._confirm_candle = None
+                self._watch_high     = None
+                self._enter(spy_close, spx_spot, target_strike, now, data)
+
+    # =========================================================================
+    # Entry — SPXW CALL at SPX + 15, premium MUST be < $4.00
+    # =========================================================================
+
+    def _enter(self, spy_close: float, spx_spot: float,
+               target_strike: float, now, data):
+
+        chain = data.option_chains.get(self._opt)
+        if chain is None and self._last_data is not None:
+            chain = self._last_data.option_chains.get(self._opt)
+        if chain is None:
+            self.log("Chain None — skipping")
+            return
+
+        contracts_all = list(chain)
+        if not contracts_all:
+            self.log("Chain empty — skipping")
+            return
+
+        today   = now.date()
+        all_exp = sorted(set(c.expiry.date() for c in contracts_all))
+        self.log(
+            f"Chain size={len(contracts_all)}  expirations={all_exp}  "
+            f"SPX={spx_spot:.2f}  target_strike={target_strike:.2f}"
+        )
+
+        # Filter 0DTE calls
+        calls = [
+            c for c in contracts_all
+            if c.right == OptionRight.CALL and c.expiry.date() == today
+        ]
+
+        # Fallback to nearest expiry
+        if not calls:
+            self.log("No 0DTE calls — trying nearest expiry")
+            all_calls = [c for c in contracts_all if c.right == OptionRight.CALL]
+            if not all_calls:
+                self.log("No calls at all — skipping")
+                return
+            nearest = min(all_calls, key=lambda c: c.expiry.date()).expiry.date()
+            calls   = [c for c in all_calls if c.expiry.date() == nearest]
+            self.log(f"Using nearest expiry={nearest}  count={len(calls)}")
+
+        # ── Find closest strike to SPX + 15 ──────────────────────────────────
+        best     = min(calls, key=lambda c: abs(c.strike - target_strike))
+        distance = abs(best.strike - target_strike)
+        self.log(
+            f"Strike: target={target_strike:.2f}  "
+            f"best={best.strike:.2f}  dist={distance:.2f}  "
+            f"expiry={best.expiry.date()}"
+        )
+
+        # ── Price the contract ────────────────────────────────────────────────
+        b   = float(best.bid_price  or 0)
+        a   = float(best.ask_price  or 0)
+        lst = float(best.last_price or 0)
+
+        if b > 0 and a > 0:
+            mid = (b + a) / 2.0
+        elif lst > 0:
+            mid = lst
+        else:
+            sec = self.securities.get(best.symbol)
+            if sec and sec.has_data:
+                sb  = float(sec.bid_price or 0)
+                sa  = float(sec.ask_price or 0)
+                mid = (sb + sa) / 2.0 if sb > 0 and sa > 0 else float(sec.price or 0)
+            else:
+                mid = 0
+
+        self.log(
+            f"Pricing: bid=${b:.2f}  ask=${a:.2f}  "
+            f"last=${lst:.2f}  mid=${mid:.2f}"
+        )
+
+        if mid <= 0:
+            self.log("Cannot price — skipping")
+            return
+
+        # ── Premium gate: MUST be $0.10 – $4.00 ──────────────────────────────
+        if mid < self.PREMIUM_MIN:
+            self.log(
+                f"PREMIUM TOO LOW  mid=${mid:.2f} < ${self.PREMIUM_MIN}  "
+                f"strike={best.strike:.2f} — skipping"
+            )
+            return
+
+        if mid > self.PREMIUM_MAX:
+            self.log(
+                f"PREMIUM > $4.00  mid=${mid:.2f}  strike={best.strike:.2f}  "
+                f"— looking for cheaper OTM strike"
+            )
+            # Try to find a further OTM strike that costs < $4.00
+            affordable = [
+                c for c in calls
+                if c.strike >= target_strike   # must be OTM (above spot)
+            ]
+            affordable.sort(key=lambda c: c.strike)  # lowest strike first
+
+            found = None
+            for c in affordable:
+                cb   = float(c.bid_price  or 0)
+                ca   = float(c.ask_price  or 0)
+                cl   = float(c.last_price or 0)
+                cmid = (cb + ca) / 2.0 if cb > 0 and ca > 0 else cl
+                if 0 < cmid <= self.PREMIUM_MAX:
+                    found = (c, cmid)
+                    self.log(
+                        f"AFFORDABLE STRIKE FOUND  "
+                        f"strike={c.strike:.2f}  mid=${cmid:.2f}  "
+                        f"(+{c.strike - spx_spot:.1f}pts from SPX)"
+                    )
+                    break
+
+            if found is None:
+                self.log(
+                    f"No affordable strike (< ${self.PREMIUM_MAX}) found — skipping"
+                )
+                return
+
+            best, mid = found
+
+        # ── SL / TP ───────────────────────────────────────────────────────────
+        sl_price       = mid * (1 - self.SL_PCT)
+        risk_per_share = mid - sl_price
+        tp_rr          = mid + (self.RR_RATIO * risk_per_share)
+        tp_dollars     = mid + (self.TP_DOLLARS / 100.0)
+        tp_price       = min(tp_rr, tp_dollars)
+
+        self.market_order(best.symbol, self.LOTS)
+
+        self._trade = {
+            "contract"   : best.symbol,
+            "qty"        : self.LOTS,
+            "entry_time" : now,
+            "entry_mid"  : mid,
+            "sl_price"   : sl_price,
+            "tp_price"   : tp_price,
+            "strike"     : best.strike,
+        }
+        self._trades_today += 1
+
+        self.log(
+            f"✅ ENTERED SPXW CALL  "
+            f"strike={best.strike:.2f} (+{best.strike - spx_spot:.1f}pts)  "
+            f"SPX={spx_spot:.2f}  SPY={spy_close:.2f}  "
+            f"mid=${mid:.2f}  bid=${b:.2f}  ask=${a:.2f}  "
+            f"sl=${sl_price:.2f} (-50%)  "
+            f"tp=${tp_price:.2f} [RR=${tp_rr:.2f} | $100=${tp_dollars:.2f}]  "
+            f"expiry={best.expiry.date()}  "
+            f"time={now.strftime('%H:%M')}"
+        )
+
+    # =========================================================================
+    # SL + TP
+    # =========================================================================
+
+    def _check_sl_tp(self, data):
+        if not self._trade:
+            return
+
+        mid = self._get_mid(self._trade["contract"], data)
+        if mid <= 0:
+            return
+
+        entry       = self._trade["entry_mid"]
+        pct         = ((mid / entry) - 1) * 100
+        pnl_dollars = (mid - entry) * 100 * self.LOTS
+
+        if mid >= self._trade["tp_price"]:
+            self.log(
+                f"TP HIT ✓  mid=${mid:.2f}  "
+                f"P&L={pct:+.1f}%  ${pnl_dollars:+.2f}"
+            )
+            self._close("TP", data)
+            return
+
+        if mid <= self._trade["sl_price"]:
+            self.log(
+                f"SL HIT ✗  mid=${mid:.2f}  "
+                f"P&L={pct:+.1f}%  ${pnl_dollars:+.2f}"
+            )
+            self._close("SL", data)
+            return
+
+        elapsed = (self.time - self._trade["entry_time"]).total_seconds() / 60.0
+        if int(elapsed) % 5 == 0 and self.time.second == 0:
+            self.log(
+                f"HOLDING {elapsed:.0f}/{self.HOLD_MINUTES}min  "
+                f"mid=${mid:.2f}  P&L={pct:+.1f}% (${pnl_dollars:+.2f})  "
+                f"sl=${self._trade['sl_price']:.2f}  "
+                f"tp=${self._trade['tp_price']:.2f}"
+            )
+
+    # =========================================================================
+    # Close
+    # =========================================================================
+
+    def _close(self, reason: str, data):
+        if not self._trade:
+            return
+
+        contract     = self._trade["contract"]
+        qty          = self._trade["qty"]
+        entry        = self._trade["entry_mid"]
+        self._trade  = None
+
+        if contract in self.securities and \
+           self.portfolio[contract].quantity > 0:
+            self.market_order(contract, -qty)
+
+        self.log(
+            f"CLOSED [{reason}]  {contract.value}  "
+            f"entry=${entry:.2f}  trades_today={self._trades_today}"
+        )
+
+    # =========================================================================
+    # Mid price
+    # =========================================================================
+
+    def _get_mid(self, contract, data) -> float:
+        chain = data.option_chains.get(self._opt)
+        if chain:
+            for c in chain:
+                if c.symbol == contract:
+                    b = float(c.bid_price  or 0)
+                    a = float(c.ask_price  or 0)
+                    l = float(c.last_price or 0)
+                    return (b + a) / 2.0 if b > 0 and a > 0 else l
+        sec = self.securities.get(contract)
+        if sec and sec.has_data:
+            b = float(sec.bid_price or 0)
+            a = float(sec.ask_price or 0)
+            return (b + a) / 2.0 if b > 0 and a > 0 else float(sec.price or 0)
+        return 0.0
+
+    # =========================================================================
+    # Order fills
+    # =========================================================================
+
+    def on_order_event(self, order_event: OrderEvent):
+        if order_event.status != OrderStatus.FILLED:
+            return
+        d = "BUY" if order_event.fill_quantity > 0 else "SELL"
+        self.log(
+            f"FILLED [{d}]  {order_event.symbol.value}  "
+            f"qty={order_event.fill_quantity}  "
+            f"price=${order_event.fill_price:.4f}"
+        )
