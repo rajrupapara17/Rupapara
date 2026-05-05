@@ -1,0 +1,31 @@
+
+LONG 15-min setup
+Candle closes above the 5 EMA — body must be fully above, no wicks touching the line
+Wait for the next candle to break the previous candle's low
+Enter on that breakdown. Stop loss = high of the signal candle
+If no breakdown occurs, track the next candle. The 5 EMA drifts toward price — wait for realignment then re-evaluate
+SHORT 5-min setup
+Same mirror logic — candle closes below 5 EMA on the 5-min chart
+Enter when the next candle breaks above the signal candle's high
+Stop loss = low of the signal candle
+Key philosophy
+SL hits are expected and normal — profits of 1:3 to 1:5 make the math work
+Plan max 3–4 trades per day. One 1:4 trade covers all daily losses
+Never switch between 5 EMA and 15 EMA in the same session — pick one and stay consistent
+Never change the rules (4 EMA, 3-min candles, etc.) — stay disciplined
+
+
+Signal 1 — Gap at support/resistance
+Identify unfilled price gaps on the daily chart
+When intraday price approaches the gap level and a 5 EMA or 15 EMA candle forms there, treat this as your highest-confidence trade
+Gaps act as support (unfilled gap below price) or resistance (unfilled gap above price)
+Unfilled gaps persist on the chart — mark them and watch for price to revisit
+Signal 2 — Range shift
+Uptrend → watch for shift: market making higher highs, then suddenly makes a lower low → range has shifted bearish. First 5 EMA pullback is an aggressive short.
+Downtrend → watch for shift: market making lower lows, then breaks a resistance and makes a higher high → range shifted bullish. First 15 EMA pullback is an aggressive long.
+The setup after a range shift carries more momentum — hold it positionally if the trend continues
+Confluence checklist for aggressive sizing
+Gap visible on daily chart at current price level
+Range shift has just occurred (trend change confirmed)
+5 EMA on 5-min AND 15 EMA on 15-min both aligned in same direction
+Previous support/resistance level matches current price
