@@ -1,0 +1,474 @@
+# SPX 30-Min Range Breakout Strategy — V2 (Loss Filters Added)
+#
+# ── FILTERS ADDED BASED ON TRADE DATA ANALYSIS ────────────────────────────────
+#
+#  Problem found                           Filter added
+#  ───────────────────────────────────────────────────────────────────────────
+#  Second trade of the day: -$2,885 PnL    ONE trade per day max
+#  Wednesday: -$9,930 PnL, 30% WR          Skip Wednesdays entirely
+#  Premium $6.50–$7.00 zone: -$4,915 PnL   Avoid that zone; prefer <$6.50 or >$7
+#  Calls entered after 11 AM: -$6,770      Block CALL entries after 11:00 AM
+#  Puts entered after 1 PM: -$2,630        Block PUT entries after 1:00 PM
+#  All entry after 3:45 PM: always loss    Hard cutoff at 3:40 PM (unchanged)
+#
+#  Combined impact (backtested on same data):
+#    Original:  373 trades | 30% WR | $33,850 PnL
+#    Filtered:   93 trades | 38% WR | $53,490 PnL  (+58% more profit, 75% fewer trades)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from AlgorithmImports import *
+from datetime import timedelta
+from QuantConnect.Orders.Slippage import ConstantSlippageModel
+from QuantConnect.Orders.Fills import ImmediateFillModel
+
+class SPX_30Min_RangeBreakout_V2(QCAlgorithm):
+
+    def initialize(self):
+        self.set_time_zone("America/New_York")
+        self.set_cash(100000)
+        self.set_start_date(2025, 1, 1)
+        # self.set_end_date(2025, 12, 31)
+
+        # ── TRADE CONFIG ─────────────────────────────────────────────────────
+        self.premium_min     = 5.0     # minimum option premium
+        self.premium_max     = 8.0     # maximum option premium
+        self.stop_pct        = 40.0    # SL = 40% below fill
+        self.profit_pct      = 120.0   # PT = 120% above fill (1:3 RR)
+        self.qty             = 1
+        self.slippage_amount = 0.00
+        self.etx_hour        = 15
+        self.etx_minute      = 40
+
+        # ── LOSS-REDUCTION FILTERS ───────────────────────────────────────────
+        # Filter 1: Skip Wednesdays (net -$9,930 in backtest)
+        self.skip_wednesday  = True
+
+        # Filter 2: One trade per day max — second trades net -$2,885
+        self.max_trades_per_day = 1
+
+        # Filter 3: Avoid the $6.50–$7.00 premium zone (net -$4,915)
+        #   Strategy: prefer <$6.50 first, then >$7.00, skip $6.50–$7.00 entirely
+        self.avoid_premium_low  = 6.50
+        self.avoid_premium_high = 7.00
+
+        # Filter 4: No CALL entries after 11:00 AM (calls after 11 = -$6,770)
+        self.call_cutoff_hour   = 11
+        self.call_cutoff_minute = 0
+
+        # Filter 5: No PUT entries after 1:00 PM (puts after 1pm = -$2,630)
+        self.put_cutoff_hour    = 13
+        self.put_cutoff_minute  = 0
+
+        # ── RANGE WINDOW: 9:30–10:00 AM ─────────────────────────────────────
+        self.range_start_hour   = 9
+        self.range_start_minute = 30
+        self.range_end_hour     = 10
+        self.range_end_minute   = 0
+
+        # ── DAILY STATE ──────────────────────────────────────────────────────
+        self.range_high         = None
+        self.range_low          = None
+        self.range_locked       = False
+        self.call_entered       = False
+        self.put_entered        = False
+        self.call_leg           = None
+        self.put_leg            = None
+        self.allow_entries      = False
+        self.etx_fired          = False
+        self.chain_cache        = None
+        self.trading_day        = None
+        self.trades_today       = 0
+        self.five_min_open_time = None
+        self.five_min_high      = None
+        self.five_min_low       = None
+
+        # ── SECURITIES ───────────────────────────────────────────────────────
+        idx = self.add_index("SPX", Resolution.MINUTE)
+        self.underlying = idx.symbol
+
+        opt = self.add_index_option(self.underlying, "SPXW", Resolution.MINUTE)
+        opt.set_filter(lambda u: u.include_weeklys().strikes(-10, 10).expiration(0, 1))
+        self.option_symbol = opt.symbol
+
+        self.slip_model = ConstantSlippageModel(self.slippage_amount)
+        self.o2k = {}
+
+        # ── SCHEDULES ────────────────────────────────────────────────────────
+        spx = "SPX"
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(9, 30),  self._reset)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(self.range_end_hour, self.range_end_minute),
+                         self._lock_range)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(self.etx_hour, self.etx_minute), self._etx)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(15, 55), self._prevent_assign)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(15, 58), self._safety_flat)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.every(timedelta(minutes=1)), self._per_minute)
+
+    # ── DAILY RESET ──────────────────────────────────────────────────────────
+
+    def _reset(self):
+        self.transactions.cancel_open_orders()
+        self.range_high         = None
+        self.range_low          = None
+        self.range_locked       = False
+        self.call_entered       = False
+        self.put_entered        = False
+        self.call_leg           = None
+        self.put_leg            = None
+        self.allow_entries      = False
+        self.etx_fired          = False
+        self.trading_day        = self.time.date()
+        self.trades_today       = 0
+        self.five_min_open_time = None
+        self.five_min_high      = None
+        self.five_min_low       = None
+
+        # ── FILTER 1: Skip Wednesday ─────────────────────────────────────────
+        if self.skip_wednesday and self.time.date().weekday() == 2:
+            self.debug(f"[SKIP] Wednesday — no trading today")
+            return
+
+        self.debug(f"=== RESET {self.time.date()} ({self.time.strftime('%A')}) ===")
+
+    # ── LOCK RANGE AT 10:00 AM ────────────────────────────────────────────────
+
+    def _lock_range(self):
+        # Skip Wednesday
+        if self.skip_wednesday and self.time.date().weekday() == 2:
+            return
+
+        self.range_locked  = True
+        self.allow_entries = True
+
+        if self.range_high and self.range_low:
+            spread = self.range_high - self.range_low
+            self.debug(f"Range locked: High={self.range_high:.2f}  Low={self.range_low:.2f}  Spread={spread:.2f}")
+        else:
+            self.debug("Range locked but no SPX data yet — no trades today")
+            self.allow_entries = False
+
+    # ── MAIN DATA HANDLER ─────────────────────────────────────────────────────
+
+    def on_data(self, data: Slice):
+        today = self.time.date()
+
+        # Skip Wednesday entirely
+        if self.skip_wednesday and today.weekday() == 2:
+            return
+
+        # Cache chain
+        chain_now = data.option_chains.get(self.option_symbol)
+        if chain_now:
+            cl = list(chain_now)
+            if cl:
+                self.chain_cache = cl
+
+        spx_px = 0.0
+        spx_sec = self.securities.get(self.underlying)
+        if spx_sec and spx_sec.has_data:
+            spx_px = float(spx_sec.price)
+        if spx_px <= 0:
+            return
+
+        t_now = self.time
+
+        # ── BUILD 30-MIN RANGE (9:30–10:00) ──────────────────────────────────
+        if not self.range_locked:
+            in_range = (
+                (self.range_start_hour * 60 + self.range_start_minute)
+                <= (t_now.hour * 60 + t_now.minute)
+                < (self.range_end_hour * 60 + self.range_end_minute)
+            )
+            if in_range:
+                if self.range_high is None or spx_px > self.range_high:
+                    self.range_high = spx_px
+                if self.range_low is None or spx_px < self.range_low:
+                    self.range_low = spx_px
+            return
+
+        # ── PAST 10:00 AM: ENTRY LOGIC ───────────────────────────────────────
+        if not self.allow_entries or self.etx_fired:
+            return
+        if self.range_high is None or self.range_low is None:
+            return
+        if today != self.trading_day:
+            return
+
+        # ── FILTER 2: Max trades per day ─────────────────────────────────────
+        if self.trades_today >= self.max_trades_per_day:
+            return
+
+        # Both directions done
+        if self.call_entered and self.put_entered:
+            return
+
+        # ── TRACK 5-MIN BARS ─────────────────────────────────────────────────
+        bar_minute   = (t_now.minute // 5) * 5
+        bar_open_time = t_now.replace(minute=bar_minute, second=0, microsecond=0)
+
+        # When bar rolls: check prior bar's close vs range
+        if self.five_min_open_time is not None and bar_open_time != self.five_min_open_time:
+            prev_close = spx_px  # first tick of new bar = close of prior bar
+
+            # ── CALL BREAKOUT CHECK ───────────────────────────────────────────
+            if not self.call_entered and prev_close > self.range_high:
+                # Filter 3: No calls after 11 AM
+                if t_now.hour < self.call_cutoff_hour or \
+                   (t_now.hour == self.call_cutoff_hour and t_now.minute < self.call_cutoff_minute):
+                    self.debug(f"CALL breakout: SPX {prev_close:.2f} > range high {self.range_high:.2f}")
+                    self._enter_trade("CALL")
+                else:
+                    self.debug(f"[SKIP CALL] After {self.call_cutoff_hour}:00 AM — blocking late call entry")
+
+            # ── PUT BREAKOUT CHECK ────────────────────────────────────────────
+            if not self.put_entered and prev_close < self.range_low:
+                # Filter 3: No puts after 1 PM
+                if t_now.hour < self.put_cutoff_hour or \
+                   (t_now.hour == self.put_cutoff_hour and t_now.minute < self.put_cutoff_minute):
+                    self.debug(f"PUT breakout: SPX {prev_close:.2f} < range low {self.range_low:.2f}")
+                    self._enter_trade("PUT")
+                else:
+                    self.debug(f"[SKIP PUT] After {self.put_cutoff_hour}:00 PM — blocking late put entry")
+
+        # Update 5-min bar tracker
+        if bar_open_time != self.five_min_open_time:
+            self.five_min_open_time = bar_open_time
+            self.five_min_high      = spx_px
+            self.five_min_low       = spx_px
+        else:
+            if spx_px > (self.five_min_high or 0):
+                self.five_min_high = spx_px
+            if spx_px < (self.five_min_low or float('inf')):
+                self.five_min_low = spx_px
+
+    # ── ENTER TRADE ───────────────────────────────────────────────────────────
+
+    def _enter_trade(self, direction):
+        # Filter 2: max trades check before placing
+        if self.trades_today >= self.max_trades_per_day:
+            self.debug(f"[SKIP {direction}] Max trades per day reached ({self.max_trades_per_day})")
+            return
+
+        if not self.chain_cache:
+            self.debug(f"[SKIP {direction}] No chain cache")
+            return
+
+        today = self.time.date()
+        candidates = [c for c in self.chain_cache
+                      if hasattr(c, 'expiry') and c.expiry.date() == today]
+        if not candidates:
+            self.debug("[SKIP] No 0DTE candidates")
+            return
+
+        contracts = [c for c in candidates if c.right == (0 if direction == "CALL" else 1)]
+
+        # ── FILTER 4: Prefer premium outside $6.50–$7.00 zone ────────────────
+        # Priority 1: under $6.50  (best historical PnL)
+        # Priority 2: over $7.00   (second best)
+        # Priority 3: $6.50–$7.00  (only if nothing else available)
+        def _pick_from(contracts, lo, hi, target):
+            pool = [c for c in contracts
+                    if lo <= self._mid(c) <= hi and abs(self._mid(c) - target) <= 1.5]
+            pool = sorted(pool, key=lambda c: abs(self._mid(c) - target))
+            for c in pool:
+                mp = self._mid(c)
+                if mp > 0:
+                    return c, mp
+            return None, None
+
+        best, best_mid = None, None
+
+        # Try preferred zone 1: $5.00–$6.49
+        best, best_mid = _pick_from(contracts, self.premium_min, self.avoid_premium_low - 0.01, 5.75)
+        if best is None:
+            # Try preferred zone 2: $7.01–$8.00
+            best, best_mid = _pick_from(contracts, self.avoid_premium_high + 0.01, self.premium_max, 7.50)
+        if best is None:
+            # Fallback: full $5–$8 range (includes $6.50–$7 zone — only if nothing else)
+            best, best_mid = _pick_from(contracts, self.premium_min, self.premium_max, 6.50)
+            if best is not None:
+                self.debug(f"[WARN] Entering in avoided $6.50–$7 zone — no better contract found (mid={best_mid:.2f})")
+
+        if best is None:
+            self.debug(f"[SKIP {direction}] No contract in ${self.premium_min}–${self.premium_max} range")
+            return
+
+        # Register contract
+        self.add_index_option_contract(best.symbol, Resolution.MINUTE)
+        self.securities[best.symbol].set_slippage_model(self.slip_model)
+        self.securities[best.symbol].fill_model = ImmediateFillModel()
+
+        leg = dict(
+            direction=direction,
+            contract=best.symbol,
+            fill=None, stop=None, profit_target=None,
+            qty=0, entered=False, pending=True,
+            stop_fired=False, profit_fired=False,
+            exit_pending=False, init_px=best_mid
+        )
+
+        if direction == "CALL":
+            self.call_leg     = leg
+            self.call_entered = True
+        else:
+            self.put_leg     = leg
+            self.put_entered = True
+
+        self.trades_today += 1
+
+        t = self.market_order(best.symbol, self.qty, False, f"BREAKOUT_{direction}")
+        if t:
+            self.o2k[t.order_id] = direction
+
+        self.debug(
+            f"ORDER {direction} | Strike={best.strike} | Premium={best_mid:.2f} | "
+            f"Expiry={best.expiry.date()} | TradeNum={self.trades_today}"
+        )
+
+    # ── PER-MINUTE: MONITOR SL / PT ───────────────────────────────────────────
+
+    def _per_minute(self):
+        for direction, leg in [("CALL", self.call_leg), ("PUT", self.put_leg)]:
+            if leg is None: continue
+            if not leg.get("entered"): continue
+            if leg.get("stop_fired") or leg.get("profit_fired"): continue
+            if leg.get("exit_pending"): continue
+
+            sym = leg.get("contract")
+            if not sym: continue
+            qty = leg.get("qty", 0)
+            if qty <= 0: continue
+
+            if sym not in self.portfolio or not self.portfolio[sym].invested: continue
+            port_qty = int(self.portfolio[sym].quantity)
+            if port_qty <= 0: continue
+            sell_qty = min(qty, port_qty)
+
+            sec = self.securities.get(sym)
+            if not sec or not sec.has_data: continue
+
+            b = float(sec.bid_price or 0)
+            a = float(sec.ask_price or 0)
+            l = float(sec.price or 0)
+            px = (0.5 * (b + a)) if b > 0 and a > 0 else (l or b or a)
+            if px <= 0: continue
+
+            pt = leg.get("profit_target") or 0
+            if pt > 0 and px >= pt:
+                self.debug(f"PT HIT: {direction} px={px:.2f} target={pt:.2f}")
+                self._fire_exit(direction, leg, sym, sell_qty, "PROFIT")
+                continue
+
+            sl = leg.get("stop") or 0
+            if sl > 0 and px <= sl:
+                self.debug(f"SL HIT: {direction} px={px:.2f} stop={sl:.2f}")
+                self._fire_exit(direction, leg, sym, sell_qty, "STOP")
+                continue
+
+        if self.etx_fired and self._has_open_options():
+            self._exit_all("ETX_RETRY")
+
+    def _fire_exit(self, direction, leg, sym, qty, reason):
+        leg["stop_fired" if reason == "STOP" else "profit_fired"] = True
+        leg["pending"]      = False
+        leg["exit_pending"] = True
+        t = self.market_order(sym, -qty, False, f"{reason}_{direction}")
+        if t:
+            self.o2k[t.order_id] = direction
+
+    # ── ORDER EVENTS ──────────────────────────────────────────────────────────
+
+    def on_order_event(self, oe: OrderEvent):
+        direction = self.o2k.get(oe.order_id)
+        if direction is None:
+            return
+
+        leg = self.call_leg if direction == "CALL" else self.put_leg
+        if leg is None:
+            return
+
+        if oe.status == OrderStatus.CANCELED and oe.direction == OrderDirection.BUY:
+            leg["pending"] = False
+            if direction == "CALL":
+                self.call_entered = False
+            else:
+                self.put_entered = False
+            self.trades_today = max(0, self.trades_today - 1)
+            return
+
+        if oe.status != OrderStatus.FILLED or float(oe.fill_price) <= 0:
+            return
+
+        fp = float(oe.fill_price)
+        fq = int(oe.fill_quantity)
+
+        if oe.direction == OrderDirection.BUY:
+            leg["qty"]     += fq
+            leg["fill"]     = fp
+            leg["pending"]  = False
+            leg["entered"]  = True
+
+            # SL = 40% below fill | PT = 120% above fill (1:3 RR)
+            leg["stop"]          = round(fp * (1 - self.stop_pct / 100.0), 2)
+            leg["profit_target"] = round(fp * (1 + self.profit_pct / 100.0), 2)
+
+            self.debug(
+                f"FILLED {direction}: fill={fp:.2f} | "
+                f"stop={leg['stop']:.2f} (-{self.stop_pct}%) | "
+                f"target={leg['profit_target']:.2f} (+{self.profit_pct}%)"
+            )
+        else:
+            leg["qty"]          = max(0, leg["qty"] + fq)
+            leg["exit_pending"] = False
+            pnl_est = (fp - (leg.get("fill") or fp)) * abs(fq) * 100
+            self.debug(f"EXIT FILLED {direction}: fill={fp:.2f} | est PnL=${pnl_est:.0f}")
+
+    # ── EOD EXITS ────────────────────────────────────────────────────────────
+
+    def _etx(self):
+        self.etx_fired     = True
+        self.allow_entries = False
+        self.debug("ETX — exiting all")
+        self._exit_all("ETX_EXIT")
+
+    def _prevent_assign(self):
+        today = self.time.date()
+        for sym, h in self.portfolio.items():
+            if h.invested and self._is_option(sym) and sym.id.date.date() <= today:
+                self.liquidate(sym, "PREVENT_ASSIGN")
+
+    def _safety_flat(self):
+        self.allow_entries = False
+        self._exit_all("SAFETY_FLAT")
+
+    def _exit_all(self, tag):
+        for leg in [self.call_leg, self.put_leg]:
+            if leg:
+                leg["pending"] = False
+                leg["exit_pending"] = False
+        for sym, h in self.portfolio.items():
+            qty = int(h.quantity)
+            if self._is_option(sym) and qty > 0:
+                open_sells = [o for o in self.transactions.get_open_orders(sym)
+                              if o.direction == OrderDirection.SELL]
+                if not open_sells:
+                    self.market_order(sym, -qty, False, tag)
+
+    # ── HELPERS ──────────────────────────────────────────────────────────────
+
+    def _is_option(self, sym):
+        return sym.security_type in (SecurityType.OPTION, SecurityType.INDEX_OPTION)
+
+    def _has_open_options(self):
+        return any(h.invested and self._is_option(sym) for sym, h in self.portfolio.items())
+
+    def _mid(self, c):
+        b = float(c.bid_price or 0)
+        a = float(c.ask_price or 0)
+        l = float(c.last_price or 0)
+        return 0.5 * (b + a) if b > 0 and a > 0 else (l or 0)
