@@ -1,0 +1,230 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+# =============================================================================
+#  SPY 5-EMA Alert Candle Strategy  --  BUY PUT (Short-side signal)
+# -----------------------------------------------------------------------------
+#  Rules (from strategy spec):
+#   1. When a candle closes COMPLETELY above the 5 EMA (no part of the candle
+#      touches the EMA, i.e. candle LOW > 5 EMA), that candle becomes the
+#      "Alert Candle".
+#   2. If the next candle is also completely above the 5 EMA and has NOT
+#      broken the low of the previous Alert Candle, the Alert Candle SHIFTS
+#      to the new candle.
+#   3. Whenever any subsequent candle breaks the LOW of the Alert Candle,
+#      take the short trade  ->  BUY PUT on SPY.
+#   4. Stop loss  = 33% of the put premium paid (option-price based).
+#      Optional:    underlying stop at Alert Candle high (useUnderlyingStop).
+#      Target     = minimum 1:3  (risk = AlertHigh - entry; TP = entry - 3*risk)
+# =============================================================================
+
+class SPY5EMABuyPut(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2026, 5, 17)
+        #self.SetEndDate(2026, 6, 30)
+        self.SetCash(100000)
+
+        # ------------------ PARAMETERS ------------------
+        self.candleMinutes   = 5        # signal timeframe (5-min candles)
+        self.emaPeriod       = 5        # the 5 EMA
+        self.rrMultiple      = 3.0      # 1:3 reward-to-risk (underlying pts)
+        self.stopLossPct     = 0.33     # exit if put loses 33% of entry premium
+        self.useUnderlyingStop = False  # True = also stop out at alert high
+        self.contractsPerTrade = 1      # puts to buy per signal
+        self.minDte          = 0        # 0 = allow 0DTE
+        self.maxDte          = 7        # nearest expiry within a week
+        self.strikesBelowAtm = 0        # 0 = ATM put, 1 = one strike OTM, etc.
+        self.entryCutoff     = time(15, 30)   # no new entries after this (ET)
+        self.flatTime        = time(15, 55)   # liquidate everything by this
+        self.oneTradePerDay  = False    # set True to limit to first signal/day
+        # ------------------------------------------------
+
+        equity = self.AddEquity("SPY", Resolution.Minute)
+        equity.SetDataNormalizationMode(DataNormalizationMode.Raw)
+        self.spy = equity.Symbol
+
+        option = self.AddOption("SPY", Resolution.Minute)
+        option.SetFilter(lambda u: u.IncludeWeeklys()
+                                    .Strikes(-10, 10)
+                                    .Expiration(self.minDte, self.maxDte))
+        self.optionSymbol = option.Symbol
+
+        # 5 EMA on consolidated candles
+        self.ema = ExponentialMovingAverage(self.emaPeriod)
+        consolidator = TradeBarConsolidator(timedelta(minutes=self.candleMinutes))
+        consolidator.DataConsolidated += self.OnCandle
+        self.SubscriptionManager.AddConsolidator(self.spy, consolidator)
+
+        # --- state ---
+        self.alertHigh   = None    # active Alert Candle high (stop reference)
+        self.alertLow    = None    # active Alert Candle low  (entry trigger)
+        self.putContract = None    # currently held put symbol
+        self.entryFillPrice = None # option premium paid at entry
+        self.entryUnderlying = None
+        self.stopLevel   = None    # underlying SL  (alert high)
+        self.targetLevel = None    # underlying TP  (entry - 3 * risk)
+        self.tradedToday = False
+
+        self.SetWarmUp(timedelta(days=2))
+
+        self.Schedule.On(self.DateRules.EveryDay(self.spy),
+                         self.TimeRules.At(9, 31),
+                         self.NewDayReset)
+
+    # ------------------------------------------------------------------ #
+    #  Daily reset -- alert candles do not carry across sessions
+    # ------------------------------------------------------------------ #
+    def NewDayReset(self):
+        self.alertHigh = None
+        self.alertLow = None
+        self.tradedToday = False
+
+    # ------------------------------------------------------------------ #
+    #  Signal logic on each consolidated candle
+    # ------------------------------------------------------------------ #
+    def OnCandle(self, sender, bar: TradeBar):
+        self.ema.Update(bar.EndTime, bar.Close)
+        if self.IsWarmingUp or not self.ema.IsReady:
+            return
+
+        emaValue = self.ema.Current.Value
+
+        # Rule 2/3: a candle breaking the alert low is handled intrabar in
+        # OnData (entry). Here we only manage alert candle creation/shift.
+        candleFullyAbove = bar.Low > emaValue
+
+        if candleFullyAbove:
+            if self.alertLow is None:
+                # Rule 1: first alert candle
+                self.alertHigh, self.alertLow = bar.High, bar.Low
+                self.Debug(f"{bar.EndTime} ALERT set  H={bar.High:.2f} L={bar.Low:.2f} EMA={emaValue:.2f}")
+            elif bar.Low >= self.alertLow:
+                # Rule 2: shift alert to newest qualifying candle
+                self.alertHigh, self.alertLow = bar.High, bar.Low
+                self.Debug(f"{bar.EndTime} ALERT shift H={bar.High:.2f} L={bar.Low:.2f} EMA={emaValue:.2f}")
+            # if bar.Low < alertLow the intrabar entry in OnData already fired
+        # A candle touching/below the EMA that did not break the alert low
+        # leaves the existing alert candle armed (spec only invalidates by
+        # shift or by the entry trigger).
+
+    # ------------------------------------------------------------------ #
+    #  Intrabar: entry trigger + trade management on minute data
+    # ------------------------------------------------------------------ #
+    def OnData(self, data: Slice):
+        if self.IsWarmingUp:
+            return
+        if self.spy not in data.Bars:
+            return
+
+        price = data.Bars[self.spy].Low   # use bar low for break detection
+        last  = data.Bars[self.spy].Close
+        now   = self.Time.time()
+
+        # ---------- manage open position ----------
+        if self.putContract is not None:
+            exitReason = None
+            sec = self.Securities[self.putContract]
+
+            # belt-and-suspenders: recover entry price from holdings if missed
+            if self.entryFillPrice is None and sec.Holdings.AveragePrice > 0:
+                self.entryFillPrice = sec.Holdings.AveragePrice
+
+            # evaluate the stop against the BID (what you'd actually get out at)
+            putPrice = sec.BidPrice if sec.BidPrice > 0 else sec.Price
+
+            # 33% premium stop loss
+            if (self.entryFillPrice is not None and putPrice > 0
+                    and putPrice <= self.entryFillPrice * (1 - self.stopLossPct)):
+                exitReason = f"STOP -{self.stopLossPct:.0%} premium"
+            elif self.useUnderlyingStop and data.Bars[self.spy].High >= self.stopLevel:
+                exitReason = "STOP (alert high hit)"
+            elif price <= self.targetLevel:
+                exitReason = "TARGET 1:3"
+            elif now >= self.flatTime:
+                exitReason = "EOD FLAT"
+
+            if exitReason:
+                self.Liquidate(self.putContract, exitReason)
+                self.Debug(f"{self.Time} EXIT {exitReason}  SPY={last:.2f}  put={putPrice:.2f}")
+                self.putContract = None
+                self.entryFillPrice = None
+                self.stopLevel = None
+                self.targetLevel = None
+                # alert already consumed; wait for a fresh alert candle
+            return
+
+        # ---------- entry ----------
+        if self.alertLow is None or now >= self.entryCutoff:
+            return
+        if self.oneTradePerDay and self.tradedToday:
+            return
+
+        if price < self.alertLow:
+            put = self.SelectPut(data)
+            if put is None:
+                return
+
+            risk = self.alertHigh - self.alertLow
+            if risk <= 0:
+                return
+
+            self.entryUnderlying = self.alertLow          # trigger level
+            self.stopLevel   = self.alertHigh
+            self.targetLevel = self.alertLow - self.rrMultiple * risk
+
+            # set state BEFORE ordering: fills are synchronous in backtests
+            self.putContract = put
+            ticket = self.MarketOrder(put, self.contractsPerTrade)
+            if ticket.AverageFillPrice > 0:
+                self.entryFillPrice = ticket.AverageFillPrice
+            self.tradedToday = True
+            self.Debug(f"{self.Time} ENTRY buy put {put.Value}  trigger={self.alertLow:.2f} "
+                       f"fill={self.entryFillPrice}  SL premium={self.entryFillPrice * (1 - self.stopLossPct) if self.entryFillPrice else 'n/a'}")
+
+            # consume the alert candle
+            self.alertHigh = None
+            self.alertLow = None
+
+    # ------------------------------------------------------------------ #
+    #  Pick the put: nearest expiry, ATM (or N strikes below ATM)
+    # ------------------------------------------------------------------ #
+    def SelectPut(self, data: Slice):
+        chain = data.OptionChains.get(self.optionSymbol)
+        if chain is None:
+            return None
+
+        puts = [c for c in chain if c.Right == OptionRight.Put]
+        if not puts:
+            return None
+
+        underlying = self.Securities[self.spy].Price
+        nearestExpiry = min(c.Expiry for c in puts)
+        puts = [c for c in puts if c.Expiry == nearestExpiry]
+
+        # sort strikes descending, closest at/below the money first
+        atmAndBelow = sorted([c for c in puts if c.Strike <= underlying],
+                             key=lambda c: c.Strike, reverse=True)
+        if not atmAndBelow:
+            atmAndBelow = sorted(puts, key=lambda c: abs(c.Strike - underlying))
+
+        idx = min(self.strikesBelowAtm, len(atmAndBelow) - 1)
+        contract = atmAndBelow[idx]
+
+        # skip illiquid quotes
+        if contract.AskPrice <= 0:
+            return None
+        return contract.Symbol
+
+    # ------------------------------------------------------------------ #
+    def OnOrderEvent(self, orderEvent: OrderEvent):
+        if orderEvent.Status == OrderStatus.Filled:
+            # secondary capture (putContract is now set before the order goes out)
+            if (self.putContract is not None
+                    and orderEvent.Symbol == self.putContract
+                    and orderEvent.FillQuantity > 0
+                    and self.entryFillPrice is None):
+                self.entryFillPrice = orderEvent.FillPrice
+            self.Debug(f"{self.Time} FILL {orderEvent.Symbol.Value} "
+                       f"{orderEvent.FillQuantity} @ {orderEvent.FillPrice}")
