@@ -1,0 +1,687 @@
+#buy instantly - BTST variant: strikes selected 10 points OTM from live SPX spot,
+#premium reference taken from the market price of that strike (no fixed premium target)
+#V3: entries restricted to PROFIT DAYS only (MON/TUE/FRI) per Fat_Black_Galago summary
+from AlgorithmImports import *
+from datetime import datetime, timedelta
+from QuantConnect.Orders.Slippage import ConstantSlippageModel
+from QuantConnect.Orders.Fills import ImmediateFillModel
+import math
+
+class SPX_BTST_OTM10_V3(QCAlgorithm):
+
+    def initialize(self):
+        self.set_time_zone("America/New_York")
+        self.set_cash(100000)
+        self.set_start_date(2026, 5, 17)
+        #self.set_end_date(2026, 1, 1)
+
+        self.MODE            = "BTST"        # BTST: enter today, exit tomorrow 9:34
+        self.tolerance       = 0.50          # only used in PREMIUM selection mode
+        self.premium_target  = 10.0           # only used in PREMIUM selection mode
+        self.profit_pct      = 500.0
+        self.qty             = 1
+        self.stop_price_mode = "MID"
+        self.slippage_amount = 0.00
+
+        # ── STRIKE SELECTION ─────────────────────────────────────────────────
+        # "OTM_POINTS": pick the strike closest to (spot + otm_points) for calls
+        #               and (spot - otm_points) for puts, at select time.
+        #               Premium reference = live mid of that contract (ATM-driven price).
+        # "PREMIUM"   : original behavior (closest premium to target).
+        self.selection_mode  = "OTM_POINTS"
+        self.otm_points      =  10
+        # ─────────────────────────────────────────────────────────────────────
+
+        self.stop_loss_mode  = "PERCENT"
+        self.stop_pct        = 33.0
+
+        self.use_underlying_candle_stop = False
+        self.use_dynamic_size = False
+        self.risk_pct         = 1.0
+        self.use_asymmetric_targets = True
+        self.call_profit_pct  = 300.0
+        self.put_profit_pct   = 500.0
+        self.use_breakeven          = False
+        self.breakeven_trigger_pct  = 100.0
+        self.use_trailing_stop      = False
+        self.trailing_stop_pct      = 50.0
+
+        # ── LAZY LEG CONFIG ──────────────────────────────────────────────────
+        self.use_lazy_leg    = False   # V2: lazy re-entries were net -$15.9k (fire in weak afternoon hours)
+        self.max_lazy_legs   = 2
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── PER-WINDOW CONFIG ────────────────────────────────────────────────
+        # NOTE: premium_target is IGNORED in OTM_POINTS mode (strike drives selection).
+        # stop_pct / profit pcts still apply per window.
+        self.candle_windows = [
+            {"start_hour": 9,  "start_minute": 35, "duration_minutes": 5,
+             "premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 400.0},
+
+            {"start_hour": 9,  "start_minute": 35, "duration_minutes": 11,
+             "premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 400.0},
+
+            {"start_hour": 9,  "start_minute": 35, "duration_minutes": 15,
+             "premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 400.0},
+
+           {"start_hour": 9,  "start_minute": 45, "duration_minutes": 5,
+             "premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 400.0},
+
+            #{"start_hour": 10, "start_minute": 0,  "duration_minutes": 5,
+             #"premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 400.0},
+
+            #{"start_hour": 10, "start_minute": 0,  "duration_minutes": 15,
+             #"premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 400.0},
+
+            #{"start_hour": 10, "start_minute": 0,  "duration_minutes": 30,
+             #"premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 350.0},
+
+             #{"start_hour": 10, "start_minute": 45,  "duration_minutes": 5,
+             #"premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 350.0},
+
+          #  {"start_hour": 11, "start_minute": 0,  "duration_minutes": 0,
+           #  "premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 350.0},
+
+           # {"start_hour": 11, "start_minute": 0,  "duration_minutes": 30,
+           #  "premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 350.0},
+
+           # {"start_hour": 12, "start_minute": 0,  "duration_minutes": 0,
+           #  "premium_target": None, "stop_pct": 33.0, "call_profit_pct": 350.0, "put_profit_pct": 350.0},
+
+        ]
+
+        # ── EXIT TIMINGS (BTST vs INTRADAY) ─────────────────────────────────────
+        if self.MODE == "BTST":
+            self.hold_overnight   = True
+            self.etx_hour         = 9
+            self.etx_minute       = 33
+            self.safety_flat_on   = False
+        else:
+            self.hold_overnight   = False
+            self.etx_hour         = 15
+            self.etx_minute       = 40
+            self.safety_flat_on   = True
+
+        # ── DAY FILTER ──────────────────────────────────────────────────────────
+        self.DAY_FILTER = "NONE"
+        self._day_filter_map = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4}
+
+        # ── V3 LOSS FILTERS ─────────────────────────────────────────────────────
+        # Trade ONLY on profit days (Fat_Black_Galago summary, May 18 - Jul 17):
+        #   Friday +$85,655 | Tuesday +$49,850 | Monday +$48,620  <- keep
+        #   Thursday -$24,020                                     <- skip (V3)
+        #   Wednesday -$78,640 (Casual_Red_Owl analysis)          <- skip (V2)
+        # Entries now fire on MON / TUE / FRI only. BTST exits at 9:33 still run
+        # every morning (Fri entries exit Mon) since this filter gates entries only.
+        self.skip_entry_days   = ["WED", "THU"]
+        # Entries after 10:30 ET bled ~-$52k across 11:00-14:00 hours.
+        self.last_entry_hour   = 10
+        self.last_entry_minute = 30
+
+        # ── SPX INDEX (underlying) ──────────────────────────────────────────────
+        idx = self.add_index("SPX", Resolution.MINUTE)
+        self.underlying = idx.symbol
+
+        # ── SPXW WEEKLY INDEX OPTIONS ───────────────────────────────────────────
+        opt = self.add_index_option(self.underlying, "SPXW", Resolution.MINUTE)
+        opt.set_filter(lambda u: u.include_weeklys().strikes(-15, 15).expiration(0, 3))
+        self.option_symbol = opt.symbol
+
+        self.slip_model    = ConstantSlippageModel(self.slippage_amount)
+        self.wins          = {}
+        self.o2k           = {}
+        self.allow_entries = False
+        self.trading_day   = None
+        self.etx_fired     = False
+        self.chain_cache   = None
+
+        spx = "SPX"
+
+        # Reset and ETX Schedules
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(9, 30), self._reset)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(int(self.etx_hour), int(self.etx_minute)), self._etx)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.at(15, 55), self._prevent_assign)
+        self.schedule.on(self.date_rules.every_day(spx),
+                         self.time_rules.every(timedelta(minutes=1)), self._per_minute)
+        if self.safety_flat_on:
+            self.schedule.on(self.date_rules.every_day(spx),
+                             self.time_rules.at(15, 58), self._safety_flat)
+
+        for i, cfg in enumerate(self.candle_windows):
+            sh  = int(cfg["start_hour"])
+            sm  = int(cfg["start_minute"])
+            dur = int(cfg["duration_minutes"])
+            total_end_min = sh * 60 + sm + dur
+            eh = int(total_end_min // 60)
+            em = int(total_end_min % 60)
+
+            self.wins[i] = self._blank_win(i, cfg, sh, sm, eh, em)
+            self.schedule.on(self.date_rules.every_day(spx),
+                             self.time_rules.at(sh, sm), self._make_select_cb(i))
+            self.schedule.on(self.date_rules.every_day(spx),
+                             self.time_rules.at(eh, em), self._make_lock_cb(i))
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _win_label(self, win_idx):
+        w = self.wins[win_idx]
+        dur = (w["eh"] * 60 + w["em"]) - (w["sh"] * 60 + w["sm"])
+        return f"{w['sh']:02d}{w['sm']:02d}_{dur}M"
+
+    def _is_option_security(self, sym):
+        return sym.security_type in (SecurityType.OPTION, SecurityType.INDEX_OPTION)
+
+    def _is_entry_day_allowed(self):
+        # V3: multi-day skip list -> entries only on MON / TUE / FRI
+        wd = self.time.date().weekday()
+        for d in (self.skip_entry_days or []):
+            if self._day_filter_map.get(str(d).upper()) == wd:
+                return False
+        if self.DAY_FILTER is None or self.DAY_FILTER == "NONE": return True
+        target_weekday = self._day_filter_map.get(self.DAY_FILTER.upper())
+        if target_weekday is None: return True
+        return self.time.date().weekday() == target_weekday
+
+    def _blank_win(self, idx, cfg, sh, sm, eh, em):
+        return dict(idx=idx, sh=sh, sm=sm, eh=eh, em=em,
+                    w_premium_target=cfg.get("premium_target"),
+                    w_stop_pct=cfg.get("stop_pct"),
+                    w_call_profit_pct=cfg.get("call_profit_pct"),
+                    w_put_profit_pct=cfg.get("put_profit_pct"),
+                    spx_candle_high=None, spx_candle_low=None, spx_candle_locked=False,
+                    legs={}, selected=False, active_date=None)
+
+    def _w_premium(self, w):
+        v = w.get("w_premium_target")
+        return v if v is not None else self.premium_target
+
+    def _w_stop_pct(self, w):
+        v = w.get("w_stop_pct")
+        return v if v is not None else self.stop_pct
+
+    def _w_call_profit_pct(self, w):
+        v = w.get("w_call_profit_pct")
+        return v if v is not None else self.call_profit_pct
+
+    def _w_put_profit_pct(self, w):
+        v = w.get("w_put_profit_pct")
+        return v if v is not None else self.put_profit_pct
+
+    def _new_leg(self, side, contract, init_px):
+        return dict(
+            side=side, contract=contract, init_px=float(init_px), sel_date=self.time.date(),
+            candle_high=None, candle_low=None, candle_locked=False, armed=False,
+            entered=False, pending=False, qty=0, fill=None, stop=None, profit_target=None,
+            stop_fired=False, profit_fired=False,
+            breakeven_trigger=None, breakeven_active=False, trail_activation=None,
+            trail_active=False, highest_px=0.0,
+            exit_pending=False,
+            lazy_count=0,
+            entry_win_idx=None
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _reset(self):
+        self.transactions.cancel_open_orders()
+        for idx, w in self.wins.items():
+            new_legs = {k: leg for k, leg in w["legs"].items() if leg.get("qty", 0) > 0 or leg.get("pending") or leg.get("exit_pending")}
+            w["legs"] = new_legs
+            w["selected"] = False
+            w["spx_candle_high"] = None
+            w["spx_candle_low"] = None
+            w["spx_candle_locked"] = False
+        self.etx_fired = False
+        self.allow_entries = False
+        self.trading_day = self.time.date()
+
+    def _make_select_cb(self, idx): return lambda: self._select_contracts(idx)
+    def _make_lock_cb(self, idx): return lambda: self._lock_candle_and_arm(idx)
+
+    def _select_contracts(self, win_idx):
+        today = self.time.date()
+        self.allow_entries = True
+        self.trading_day = today
+        w = self.wins[win_idx]
+
+        if not self._is_entry_day_allowed() or not self.chain_cache: return
+
+        # BTST: next trading day expiry (Fri -> Mon, Sat -> Mon safety)
+        target_d = today + timedelta({4: 3, 5: 2}.get(today.weekday(), 1)) if self.hold_overnight else today
+        candidates = [c for c in self.chain_cache if hasattr(c, 'expiry') and c.expiry.date() == target_d]
+        if not candidates: return
+
+        calls = [c for c in candidates if c.right == 0]
+        puts  = [c for c in candidates if c.right == 1]
+
+        if str(self.selection_mode).upper() == "OTM_POINTS":
+            # ── 10-POINT OTM SELECTION: anchor on live SPX spot (ATM) ──
+            spx_px = 0.0
+            spx_sec = self.securities.get(self.underlying)
+            if spx_sec and spx_sec.has_data:
+                spx_px = float(spx_sec.price)
+            if spx_px <= 0: return
+
+            call_pick, call_mid = self._pick_otm_strike(calls, spx_px, spx_px + self.otm_points, is_call=True)
+            put_pick,  put_mid  = self._pick_otm_strike(puts,  spx_px, spx_px - self.otm_points, is_call=False)
+        else:
+            target_premium = self._w_premium(w)
+            call_pick, call_mid = self._pick_closest_to_target(calls, target_premium)
+            put_pick,  put_mid  = self._pick_closest_to_target(puts, target_premium)
+
+        if call_pick is None and put_pick is None: return
+
+        w["legs"].clear()
+        w["selected"] = True
+        w["active_date"] = today
+        w["spx_candle_high"] = None
+        w["spx_candle_low"] = None
+        w["spx_candle_locked"] = False
+
+        if call_pick is not None:
+            self.add_index_option_contract(call_pick.symbol, Resolution.MINUTE)
+            self.securities[call_pick.symbol].set_slippage_model(self.slip_model)
+            self.securities[call_pick.symbol].fill_model = ImmediateFillModel()
+            w["legs"]["CALL"] = self._new_leg("CALL", call_pick.symbol, call_mid)
+
+        if put_pick is not None:
+            self.add_index_option_contract(put_pick.symbol, Resolution.MINUTE)
+            self.securities[put_pick.symbol].set_slippage_model(self.slip_model)
+            self.securities[put_pick.symbol].fill_model = ImmediateFillModel()
+            w["legs"]["PUT"] = self._new_leg("PUT", put_pick.symbol, put_mid)
+
+    def _pick_otm_strike(self, contracts, spot, target_strike, is_call):
+        """
+        Pick the contract whose strike is closest to target_strike
+        (spot +/- otm_points), restricted to OTM strikes only.
+        Premium reference = live mid of that contract, so the premium
+        is fully driven by the ATM-anchored strike, not a fixed target.
+        Falls back to the next-closest strike if the closest has no quote.
+        """
+        if not contracts: return None, None
+        if is_call:
+            otm = [c for c in contracts if float(c.strike) >= spot]
+        else:
+            otm = [c for c in contracts if float(c.strike) <= spot]
+        pool = otm if otm else contracts
+        for c in sorted(pool, key=lambda c: abs(float(c.strike) - target_strike)):
+            mp = self._mid(c)
+            if mp > 0:
+                return c, mp
+        return None, None
+
+    def _pick_closest_to_target(self, contracts, target):
+        if not contracts: return None, None
+        sorted_c = sorted(contracts, key=lambda c: abs(self._mid(c) - target))
+        for c in sorted_c:
+            mp = self._mid(c)
+            if mp > 0 and abs(mp - target) <= self.tolerance: return c, mp
+        return None, None
+
+    def _lock_candle_and_arm(self, win_idx):
+        w = self.wins[win_idx]
+        w["spx_candle_locked"] = True
+        for k, leg in w["legs"].items():
+            if not leg.get("entered") and not leg.get("pending"):
+                leg["candle_locked"] = True
+                leg["armed"] = True
+
+    def _etx(self):
+        self.etx_fired = True
+        self.allow_entries = False
+        self.trading_day = self.time.date()
+        self._exit_all("ETX_EXIT")
+
+    def _prevent_assign(self):
+        today = self.time.date()
+        for sym, h in self.portfolio.items():
+            if h.invested and self._is_option_security(sym) and sym.id.date.date() <= today:
+                self.liquidate(sym, "PREVENT_ASSIGN")
+
+    def _safety_flat(self):
+        self.allow_entries = False
+        self.trading_day = self.time.date()
+        self._exit_all("SAFETY_FLAT")
+
+    def _has_open_options(self):
+        return any(h.invested and self._is_option_security(sym) for sym, h in self.portfolio.items())
+
+    def _exit_all(self, tag):
+        for w in self.wins.values():
+            for leg in w["legs"].values():
+                leg["pending"], leg["armed"], leg["qty"] = False, False, 0
+                leg["exit_pending"] = False
+        for sym, h in self.portfolio.items():
+            qty = int(h.quantity)
+            if sym.security_type == SecurityType.EQUITY and qty: self.liquidate(sym, "UNWANTED_EQ")
+            elif self._is_option_security(sym) and qty > 0:
+                if not any(o.direction == OrderDirection.SELL for o in self.transactions.get_open_orders(sym)):
+                    self.market_order(sym, -qty, False, tag)
+
+    def _per_minute(self):
+        spx_px = 0.0
+        spx_sec = self.securities.get(self.underlying)
+        if spx_sec and spx_sec.has_data:
+            spx_px = float(spx_sec.price)
+
+        for win_idx, w in self.wins.items():
+            for k, leg in list(w["legs"].items()):
+                if not leg.get("entered") or leg.get("stop_fired") or leg.get("profit_fired"): continue
+                if leg.get("exit_pending"): continue
+                sym = leg.get("contract")
+                if not sym: continue
+
+                leg_qty = leg.get("qty", 0)
+                if leg_qty <= 0: continue
+
+                if sym not in self.portfolio or not self.portfolio[sym].invested: continue
+                actual_portfolio_qty = int(self.portfolio[sym].quantity)
+                if actual_portfolio_qty <= 0: continue
+                sell_qty = min(leg_qty, actual_portfolio_qty)
+
+                sec = self.securities.get(sym)
+                if sec and sec.has_data:
+                    px = self._sec_stop_px(sec)
+                    if px <= 0: continue
+
+                    if self.use_trailing_stop:
+                        if leg.get("trail_active"):
+                            leg["highest_px"] = max(leg.get("highest_px", px), px)
+                            new_stop = leg["highest_px"] * (1 - self.trailing_stop_pct / 100.0)
+                            leg["stop"] = max(leg.get("stop", 0), new_stop)
+                        elif leg.get("trail_activation") and px >= leg["trail_activation"]:
+                            leg["trail_active"] = True
+                            leg["highest_px"] = px
+                    else:
+                        target_val = leg.get("profit_target") or 0
+                        if target_val > 0 and px >= target_val:
+                            self._fire_profit(win_idx, k, leg, sym, sell_qty)
+                            continue
+
+                    if self.use_breakeven and not leg.get("breakeven_active") and not leg.get("trail_active"):
+                        be_trigger = leg.get("breakeven_trigger")
+                        if be_trigger and px >= be_trigger:
+                            leg["breakeven_active"] = True
+                            leg["stop"] = max(leg.get("stop", 0), leg.get("fill", 0))
+
+                    stop_val = leg.get("stop") or 0
+                    if stop_val > 0 and px <= stop_val:
+                        self._fire_stop(win_idx, k, leg, sym, sell_qty)
+                        continue
+
+                    if self.use_underlying_candle_stop and spx_px > 0:
+                        spx_high = w.get("spx_candle_high")
+                        spx_low  = w.get("spx_candle_low")
+                        if k == "CALL" and spx_low is not None and spx_low > 0:
+                            if spx_px < spx_low:
+                                self._fire_stop(win_idx, k, leg, sym, sell_qty)
+                                continue
+                        elif k == "PUT" and spx_high is not None and spx_high > 0:
+                            if spx_px > spx_high:
+                                self._fire_stop(win_idx, k, leg, sym, sell_qty)
+                                continue
+
+        if self.etx_fired:
+            if self._has_open_options(): self._exit_all("ETX_RETRY")
+            else: self.etx_fired = False
+
+    def _fire_stop(self, win_idx, key, leg, contract, qty):
+        effective_idx = leg.get("entry_win_idx")
+        if effective_idx is None:
+            effective_idx = win_idx
+        label = self._win_label(effective_idx)
+
+        leg["stop_fired"] = True
+        leg["armed"]      = False
+        leg["pending"]    = False
+        leg["exit_pending"] = True
+
+        t = self.market_order(contract, -qty, False, f"STOP_{label}_{key}")
+        if t: self.o2k[t.order_id] = (win_idx, key)
+
+    def _fire_profit(self, win_idx, key, leg, contract, qty):
+        effective_idx = leg.get("entry_win_idx")
+        if effective_idx is None:
+            effective_idx = win_idx
+        label = self._win_label(effective_idx)
+
+        leg["profit_fired"] = True
+        leg["armed"]        = False
+        leg["pending"]      = False
+        leg["exit_pending"] = True
+
+        t = self.market_order(contract, -qty, False, f"PROFIT_{label}_{key}")
+        if t: self.o2k[t.order_id] = (win_idx, key)
+
+    def on_data(self, data: Slice):
+        today = self.time.date()
+        for sym, h in self.portfolio.items():
+            if h.invested and sym.security_type == SecurityType.EQUITY:
+                self.liquidate(sym, "FALLBACK_EQ")
+
+        chain_now = data.option_chains.get(self.option_symbol)
+        if chain_now:
+            cl = list(chain_now)
+            if cl: self.chain_cache = cl
+
+        spx_px = 0.0
+        spx_sec = self.securities.get(self.underlying)
+        if spx_sec and spx_sec.has_data:
+            spx_px = float(spx_sec.price)
+
+        t_now = self.time
+        etx_block = self.etx_fired or self._is_past_etx(t_now) if self.MODE == "INTRADAY" else self.etx_fired
+
+        for win_idx, w in self.wins.items():
+            if not w.get("selected") or w.get("active_date") != today: continue
+            in_window = self._is_in_candle_window(w, t_now)
+            past_window = self._is_past_candle_end(w, t_now)
+
+            if in_window and not w.get("spx_candle_locked") and spx_px > 0:
+                if w["spx_candle_high"] is None or spx_px > w["spx_candle_high"]:
+                    w["spx_candle_high"] = spx_px
+                if w["spx_candle_low"] is None or spx_px < w["spx_candle_low"]:
+                    w["spx_candle_low"] = spx_px
+
+            for k, leg in w["legs"].items():
+                sym = leg.get("contract")
+                if not sym: continue
+
+                b, a, l, mid = self._marks(sym, data)
+                option_mark = mid or l
+
+                if in_window and not leg.get("candle_locked"):
+                    if option_mark and option_mark > 0:
+                        if leg.get("candle_high") is None or option_mark > leg["candle_high"]:
+                            leg["candle_high"] = option_mark
+                        if leg.get("candle_low") is None or option_mark < leg["candle_low"]:
+                            leg["candle_low"] = option_mark
+
+                # ── BREAKOUT: instant buy when SPX breaks the candle level ──
+                past_last_entry = (t_now.hour * 60 + t_now.minute) > (self.last_entry_hour * 60 + self.last_entry_minute)
+                if leg.get("armed") and not leg.get("entered") and not leg.get("pending") \
+                   and past_window and not etx_block and not past_last_entry \
+                   and self.allow_entries and self.trading_day == today:
+
+                    spx_high = w.get("spx_candle_high")
+                    spx_low  = w.get("spx_candle_low")
+
+                    if k == "CALL" and spx_high is not None and spx_px > 0:
+                        if spx_px > spx_high:
+                            self._fire_breakout_entry(win_idx, k, leg, option_mark)
+
+                    elif k == "PUT" and spx_low is not None and spx_px > 0:
+                        if spx_px < spx_low:
+                            self._fire_breakout_entry(win_idx, k, leg, option_mark)
+
+    def _fire_breakout_entry(self, win_idx, key, leg, mark):
+        sym = leg.get("contract")
+        if not sym: return
+        if not mark or mark <= 0: return
+
+        w = self.wins[win_idx]
+        candle_high = leg.get("candle_high")
+        candle_low  = leg.get("candle_low")
+
+        # ── LAZY LEG FIX: use current mark as reference for profit target ──
+        if leg.get("lazy_count", 0) > 0:
+            candle_high = mark
+            leg["candle_high"] = mark
+            leg["candle_low"]  = mark
+
+        if candle_high is not None and candle_high > 0:
+            if self.use_asymmetric_targets:
+                tgt_pct = self._w_call_profit_pct(w) if key == "CALL" else self._w_put_profit_pct(w)
+            else:
+                tgt_pct = self.profit_pct
+            leg["profit_target"] = candle_high * (1 + tgt_pct / 100.0)
+        else:
+            leg["profit_target"] = 0.0
+
+        w_stop = self._w_stop_pct(w)
+
+        if self.use_dynamic_size:
+            equity = self.portfolio.total_portfolio_value
+            risk_amount = equity * (self.risk_pct / 100.0)
+            max_loss_per_contract = mark * (w_stop / 100.0) * 100
+            trade_qty = max(1, int(math.floor(risk_amount / max_loss_per_contract))) if max_loss_per_contract > 0 else self.qty
+        else:
+            trade_qty = self.qty
+
+        # ── LAZY LEG: increase qty by lazy_count ──
+        trade_qty = trade_qty + leg.get("lazy_count", 0)
+
+        mode = str(self.stop_loss_mode).strip().upper()
+        if mode == "PERCENT":
+            leg["stop"] = mark * (1 - w_stop / 100.0)
+        elif mode == "CANDLE_LOW":
+            leg["stop"] = candle_low if (candle_low is not None and candle_low > 0) else 0.0
+        else:
+            leg["stop"] = 0.0
+
+        leg["pending"]       = True
+        leg["armed"]         = False
+        leg["stop_fired"]    = False
+        leg["profit_fired"]  = False
+        leg["entry_win_idx"] = win_idx
+
+        label = self._win_label(win_idx)
+        lc = leg.get("lazy_count", 0)
+        tag = f"BREAKOUT_{label}_{key}" if lc == 0 else f"LAZY{lc}_{label}_{key}"
+
+        t = self.market_order(sym, trade_qty, False, tag)
+        if t: self.o2k[t.order_id] = (win_idx, key)
+
+    def on_order_event(self, oe: OrderEvent):
+        meta = self.o2k.get(oe.order_id)
+
+        if meta is None:
+            for w_idx, w in self.wins.items():
+                for k, l in w["legs"].items():
+                    if l.get("contract") != oe.symbol:
+                        continue
+                    if oe.direction == OrderDirection.BUY and l.get("pending"):
+                        meta = (w_idx, k)
+                        break
+                    elif oe.direction == OrderDirection.SELL and l.get("exit_pending"):
+                        meta = (w_idx, k)
+                        break
+                if meta: break
+
+        if meta is None: return
+        win_idx, key = meta
+        leg = self.wins[win_idx]["legs"].get(key)
+        if leg is None: return
+
+        if oe.status == OrderStatus.CANCELED and oe.direction == OrderDirection.BUY:
+            leg["pending"] = False
+            return
+
+        if oe.status != OrderStatus.FILLED or float(oe.fill_price) <= 0: return
+
+        fp, fq = float(oe.fill_price), int(oe.fill_quantity)
+        if oe.direction == OrderDirection.BUY:
+            leg["qty"]     += fq
+            leg["fill"]     = fp
+            leg["pending"]  = False
+            leg["entered"]  = True
+
+            w = self.wins[win_idx]
+            w_stop = self._w_stop_pct(w)
+            if str(self.stop_loss_mode).strip().upper() == "PERCENT":
+                leg["stop"] = fp * (1 - w_stop / 100.0)
+
+            # ── Profit target recalc on actual fill for lazy legs ──
+            if leg.get("lazy_count", 0) > 0:
+                if self.use_asymmetric_targets:
+                    tgt_pct = self._w_call_profit_pct(w) if key == "CALL" else self._w_put_profit_pct(w)
+                else:
+                    tgt_pct = self.profit_pct
+                leg["profit_target"] = fp * (1 + tgt_pct / 100.0)
+                leg["candle_high"]   = fp
+
+            if self.use_asymmetric_targets:
+                base_tgt_pct = self._w_call_profit_pct(w) if key == "CALL" else self._w_put_profit_pct(w)
+            else:
+                base_tgt_pct = self.profit_pct
+            leg["trail_activation"]  = fp * (1 + base_tgt_pct / 100.0)
+            leg["breakeven_trigger"] = fp * (1 + self.breakeven_trigger_pct / 100.0)
+        else:
+            # ── SELL FILL ──
+            leg["qty"] = max(0, leg["qty"] + fq)
+            leg["exit_pending"] = False
+
+            # ── LAZY LEG: re-arm after stop loss if allowed ──
+            if self.use_lazy_leg and leg.get("stop_fired") and not leg.get("profit_fired"):
+                cur_lazy = leg.get("lazy_count", 0)
+                if cur_lazy < self.max_lazy_legs and self.allow_entries and not self.etx_fired:
+                    leg["lazy_count"]       = cur_lazy + 1
+                    leg["entered"]          = False
+                    leg["stop_fired"]       = False
+                    leg["profit_fired"]     = False
+                    leg["armed"]            = True
+                    leg["pending"]          = False
+                    leg["fill"]             = None
+                    leg["stop"]             = None
+                    leg["profit_target"]    = None
+                    leg["qty"]              = 0
+                    leg["candle_high"]      = None
+                    leg["candle_low"]       = None
+                    leg["breakeven_active"] = False
+                    leg["breakeven_trigger"]= None
+                    leg["trail_active"]     = False
+                    leg["trail_activation"] = None
+                    leg["highest_px"]       = 0.0
+
+    # ── time helpers ─────────────────────────────────────────────────────────
+
+    def _is_in_candle_window(self, w, t): return (w["sh"] * 60 + w["sm"]) <= (t.hour * 60 + t.minute) < (w["eh"] * 60 + w["em"])
+    def _is_past_candle_end(self, w, t): return (t.hour * 60 + t.minute) >= (w["eh"] * 60 + w["em"])
+    def _is_past_etx(self, t): return (t.hour * 60 + t.minute) >= (self.etx_hour * 60 + self.etx_minute)
+
+    # ── price helpers ────────────────────────────────────────────────────────
+
+    def _mid(self, c):
+        b = float(c.bid_price or 0); a = float(c.ask_price or 0); l = float(c.last_price or 0)
+        return 0.5*(b+a) if b>0 and a>0 else (l or 0)
+
+    def _marks(self, sym, data):
+        chain = data.option_chains.get(self.option_symbol)
+        if chain:
+            for c in chain:
+                if c.symbol == sym:
+                    b = float(c.bid_price or 0); a = float(c.ask_price or 0); l = float(c.last_price or 0)
+                    return b, a, l, (0.5*(b+a) if b>0 and a>0 else (l or 0))
+        sec = self.securities.get(sym)
+        if sec and sec.has_data:
+            b = float(sec.bid_price or 0); a = float(sec.ask_price or 0); l = float(sec.price or 0)
+            return b, a, l, (0.5*(b+a) if b>0 and a>0 else (l or 0))
+        return 0, 0, 0, 0
+
+    def _sec_stop_px(self, sec):
+        b = float(sec.bid_price or 0); a = float(sec.ask_price or 0); l = float(sec.price or 0)
+        m = 0.5*(b+a) if b>0 and a>0 else 0
+        return (b or l or a) if self.stop_price_mode == "BID" else (m or l or b)
